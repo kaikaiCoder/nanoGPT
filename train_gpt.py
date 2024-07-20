@@ -102,7 +102,7 @@ class GPT(nn.Module):
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, y):
         B, T = x.size()
         assert (
             T <= self.config.block_size
@@ -114,8 +114,11 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)
-        return logits
+        logits = self.lm_head(x)  # B, T, V
+        loss = None
+        if y is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -185,18 +188,58 @@ print(f"using device: {device}")
 num_return_sequence = 5
 max_length = 30
 
-# model = GPT.from_pretrained("gpt2")
-model = GPT(GPTConfig())
-model.eval()
-model.to(device)
-
 import tiktoken
 
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("hello, I'm language model,")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequence, 1)
-x = tokens.to(device)
+
+class DataLoader:
+
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open("input.txt", "r") as f:
+            text = f.read()
+            text = text
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(tokens)} tokens")
+        print(f"1 epoch = {len(tokens) // (B*T)} batches")
+
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T, start = self.B, self.T, self.current_position
+        end = self.current_position + B * T + 1
+        buf = self.tokens[start:end]
+        x = buf[:-1].view(B, T)
+        y = buf[1:].view(B, T)
+        self.current_position += B * T
+        if self.current_position + B * T + 1 > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+
+train_loader = DataLoader(4, 32)
+
+model = GPT(GPTConfig())
+model.to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step: {i}, loss: {loss.item()}")
+
+import sys
+
+sys.exit(0)
+
 
 torch.manual_seed(42)
 while x.size(1) < max_length:
