@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
+import math
 import time
 import torch.nn.functional as F
 
@@ -250,6 +251,22 @@ model = GPT(GPTConfig())
 model.to(device)
 model = torch.compile(model)
 
+max_lr = 3e-4
+min_lr = 0.1 * max_lr
+warmup_steps = 1000
+max_steps = 50
+
+
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    if it > max_steps:
+        return min_lr
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
+
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 
 for i in range(50):
@@ -264,6 +281,9 @@ for i in range(50):
         logits, loss = model(x, y)
     loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(i)
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
