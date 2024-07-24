@@ -47,6 +47,12 @@ class DataLoader:
         # self.tokens = torch.tensor(tokens)
         # print(f"loaded {len(tokens)} tokens")
         self.current_position = B * T * process_rank
+        self.reset()
+
+    def reset(self):
+        self.current_position = self.B * self.T * self.procee_rank
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shard[self.current_shard])
 
     def next_batch(self):
         B, T, start = self.B, self.T, self.current_position
@@ -57,7 +63,7 @@ class DataLoader:
         self.current_position += B * T * self.num_process
         if self.current_position + B * T * self.num_process + 1 > len(self.tokens):
             # if we reach the end of the shard, move to the next shard
-            self.current_shard  = (self.current_shard + 1) % len(self.shard)
+            self.current_shard = (self.current_shard + 1) % len(self.shard)
             self.tokens = load_tokens(self.shard[self.current_shard])
             self.current_position = B * T * self.procee_rank
         return x, y
@@ -316,14 +322,21 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> gradient accumulation steps: {grad_acc_steps}")
 
-train_loader = DataLoader(B, T, process_rank=ddp_rank, num_process=ddp_world_size,split="train")
+train_loader = DataLoader(
+    B, T, process_rank=ddp_rank, num_process=ddp_world_size, split="train"
+)
+val_loader = DataLoader(
+    B, T, process_rank=ddp_rank, num_process=ddp_world_size, split="val"
+)
 
 if device == "cuda":
     torch.set_float32_matmul_precision("high")
 
 model = GPT(GPTConfig())
 model.to(device)
-model = torch.compile(model)
+useCompile = False
+if useCompile:
+    model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.moudle if ddp else model
@@ -346,8 +359,59 @@ def get_lr(it):
 
 optimizer = raw_model.configure_optimizers(0.1, 3e-4, device)
 
-for i in range(50):
+
+def val():
+    model.eval()
+    val_loader.reset()
+    with torch.no_grad():
+        val_loss_accum = 0.0
+        val_loss_steps = 20
+        for _ in range(val_loss_steps):
+            x, y = val_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            loss = loss / val_loss_steps
+            val_loss_accum += loss.detach()
+
+        if ddp:
+            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+
+
+def sample():
+    enc = tiktoken.get_encoding("gpt2")
+    model.eval()
+    num_return_sequence = 4
+    max_length = 32
+    tokens = enc.encode("Hello, I'm a language model,")
+    tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
+    sample_rng = torch.Generator(device=device)
+    sample_rng.manual_seed(42 + ddp_rank)
+    while tokens.size(1) < max_length:
+        with torch.no_grad():
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits = model(tokens)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            topk_probs, topk_indces = torch.topk(probs, 50, dim=-1)
+            ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
+            xcol = torch.gather(topk_indces, -1, ix)
+            tokens = torch.cat((tokens, xcol), dim=1)
+        for i in range(num_return_sequence):
+            tokens_i = tokens[i, :max_length].tolist()
+            decode = enc.decode(tokens_i)
+            print(f"rank {ddp_rank} sample {i}: {decode}")
+
+
+for i in range(max_steps):
+    last_step = i == max_steps - 1
     t0 = time.time()
+    if not useCompile and (i % 100 == 0 or last_step):
+        val()
+    if ((i > 0 and i % 100 == 0) or last_step) and not useCompile:
+        sample()
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_acc_steps):
@@ -380,25 +444,3 @@ for i in range(50):
         )
 if ddp:
     destroy_process_group()
-
-import sys
-
-sys.exit(0)
-# ======================= predict =======================
-num_return_sequence = 5
-max_length = 30
-torch.manual_seed(42)
-while x.size(1) < max_length:
-    with torch.no_grad():
-        logits = model(x)
-        logits = logits[:, -1, :]
-        probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_indces = torch.topk(probs, 50, dim=-1)
-        ix = torch.multinomial(topk_probs, 1)
-        x_col = torch.gather(topk_indces, -1, ix)
-        x = torch.cat((x, x_col), dim=1)
-
-for i in range(num_return_sequence):
-    tokens = x[i, :max_length].tolist()
-    decode = enc.decode(tokens)
-    print(">", decode)
