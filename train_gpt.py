@@ -10,23 +10,42 @@ import torch.distributed as dist
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import tiktoken
+import numpy as np
+
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 
 class DataLoader:
 
-    def __init__(self, B, T, process_rank, num_process):
+    def __init__(self, B, T, process_rank, num_process, split):
         self.B = B
         self.T = T
         self.procee_rank = process_rank
         self.num_process = num_process
+        assert split in {"train", "val"}
 
-        with open("input.txt", "r") as f:
-            text = f.read()
-            text = text
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"loaded {len(tokens)} tokens")
+        data_dir = "edu_fineweb10B"
+        shard = os.listdir(data_dir)
+        shard = [s for s in shard if split in s]
+        shard = sorted(shard)
+        self.shard = shard
+        assert len(shard) > 0, f"no data files found in {data_dir}"
+        if master_process:
+            print(f"found {len(shard)} shards for {split}")
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shard[self.current_shard])
+
+        # with open("input.txt", "r") as f:
+        #     text = f.read()
+        #     text = text
+        # enc = tiktoken.get_encoding("gpt2")
+        # tokens = enc.encode(text)
+        # self.tokens = torch.tensor(tokens)
+        # print(f"loaded {len(tokens)} tokens")
         self.current_position = B * T * process_rank
 
     def next_batch(self):
@@ -37,6 +56,9 @@ class DataLoader:
         y = buf[1:].view(B, T)
         self.current_position += B * T * self.num_process
         if self.current_position + B * T * self.num_process + 1 > len(self.tokens):
+            # if we reach the end of the shard, move to the next shard
+            self.current_shard  = (self.current_shard + 1) % len(self.shard)
+            self.tokens = load_tokens(self.shard[self.current_shard])
             self.current_position = B * T * self.procee_rank
         return x, y
 
@@ -258,6 +280,8 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 
 # set up distributed data parallel
+# DDP launch  for 2 GPUs:
+# torchrun --standalone --nproc_per_node=2 train_gpt.py
 ddp = int(os.environ.get("RANK", -1)) != -1
 if ddp:
     print("using distributed data parallel")
@@ -292,7 +316,7 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> gradient accumulation steps: {grad_acc_steps}")
 
-train_loader = DataLoader(B, T, process_rank=ddp_rank, num_process=ddp_world_size)
+train_loader = DataLoader(B, T, process_rank=ddp_rank, num_process=ddp_world_size,split="train")
 
 if device == "cuda":
     torch.set_float32_matmul_precision("high")
@@ -306,8 +330,8 @@ raw_model = model.moudle if ddp else model
 
 max_lr = 3e-4
 min_lr = 0.1 * max_lr
-warmup_steps = 1000
-max_steps = 50
+warmup_steps = 715
+max_steps = 19073
 
 
 def get_lr(it):
