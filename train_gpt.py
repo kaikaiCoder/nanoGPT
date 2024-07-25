@@ -11,6 +11,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import tiktoken
 import numpy as np
+from hella_swag import render_example, iterate_examples
 
 
 def load_tokens(filename):
@@ -105,13 +106,6 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, -1).transpose(1, 2)
         k = k.view(B, T, self.n_head, -1).transpose(1, 2)
         v = v.view(B, T, self.n_head, -1).transpose(1, 2)  # B, nh, T, hs
-        # att = (q @ k.transpose(-2, -1)) * 1.0 / math.sqrt(k.size(-1))  # B, nh, T, T
-        # att = att.masked_fill(
-        #     self.bias[:, :, :T, :T] == 0, float("-inf")
-        # )  # T * T mask current sequence length
-        # att = F.softmax(att, dim=-1)
-        # y = att @ v
-
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -312,7 +306,7 @@ else:
 
 # gradient accumulation
 total_batch_size = 2**19  # ~0.5M tokens
-B = 16
+B = 64
 T = 1024
 assert (
     total_batch_size % (B * T * ddp_world_size) == 0
@@ -344,7 +338,7 @@ raw_model = model.moudle if ddp else model
 max_lr = 3e-4
 min_lr = 0.1 * max_lr
 warmup_steps = 715
-max_steps = 19073
+max_steps = 19073 * 4
 
 
 def get_lr(it):
@@ -360,7 +354,7 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(0.1, 3e-4, device)
 
 
-def val():
+def val(step,last_step):
     model.eval()
     val_loader.reset()
     with torch.no_grad():
@@ -378,40 +372,87 @@ def val():
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if i > 0 and (i % 5000 == 0 or last_step):
+                checkpoint_path = os.path.join(log_dir, f"model_{i:05d}.pt")
+                checkpoint = {
+                    "model": raw_model.state_dict(),
+                    "config": raw_model.config,
+                    "step": step,
+                    "val_loss": val_loss_accum.item(),
+                }
+                torch.save(checkpoint, checkpoint_path)
 
 
-def sample():
-    enc = tiktoken.get_encoding("gpt2")
-    model.eval()
-    num_return_sequence = 4
-    max_length = 32
-    tokens = enc.encode("Hello, I'm a language model,")
-    tokens = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
-    sample_rng = torch.Generator(device=device)
-    sample_rng.manual_seed(42 + ddp_rank)
-    while tokens.size(1) < max_length:
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(
+        flat_shift_logits, flat_shift_tokens, reduction="none"
+    )
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (
+        mask[..., 1:]
+    ).contiguous()  # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
+
+def sample(step):
+    num_correct_norm = 0
+    num_total = 0
+    for i, example in enumerate(iterate_examples("val")):
+        # only process examples where i % ddp_world_size == ddp_rank
+        if i % ddp_world_size != ddp_rank:
+            continue
+        # render the example into tokens and labels
+        _, tokens, mask, label = render_example(example)
+        tokens = tokens.to(device)
+        mask = mask.to(device)
         with torch.no_grad():
             with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                logits = model(tokens)
-            logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
-            topk_probs, topk_indces = torch.topk(probs, 50, dim=-1)
-            ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
-            xcol = torch.gather(topk_indces, -1, ix)
-            tokens = torch.cat((tokens, xcol), dim=1)
-        for i in range(num_return_sequence):
-            tokens_i = tokens[i, :max_length].tolist()
-            decode = enc.decode(tokens_i)
-            print(f"rank {ddp_rank} sample {i}: {decode}")
+                logits, loss = model(tokens)  # (4 * seq_len_vocab)
+            pred_norm = get_most_likely_row(tokens, mask, logits)
+        num_total += 1
+        num_correct_norm += int(pred_norm == label)
+    if ddp:
+        num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+        num_correct_norm = torch.tensor(
+            num_correct_norm, dtype=torch.long, device=device
+        )
+        dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+        dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+        num_total = num_total.item()
+        num_correct_norm = num_correct_norm.item()
+    acc_norm = num_correct_norm / num_total
+    if master_process:
+        print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} hella {acc_norm:.4f}\n")
 
+
+log_dir = "log"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, f"log.txt")
 
 for i in range(max_steps):
     last_step = i == max_steps - 1
     t0 = time.time()
     if not useCompile and (i % 100 == 0 or last_step):
-        val()
-    if ((i > 0 and i % 100 == 0) or last_step) and not useCompile:
-        sample()
+        val(i,last_step)
+    if ((i > 0 and i % 100 == 0) or last_step) and (not useCompile):
+        sample(i)
     optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_acc_steps):
@@ -442,5 +483,7 @@ for i in range(max_steps):
         print(
             f"step {i:4d} | loss: {loss_accum.item():.6f} | lr:{lr:.4e} | dt: {dt*1000:.2f} | norm: {norm:.4f} | tok/sec: {token_processed/dt:.2f}"
         )
+        with open(log_file, "a") as f:
+            f.write(f"{i} train  {loss_accum.itme():.4f}")
 if ddp:
     destroy_process_group()
