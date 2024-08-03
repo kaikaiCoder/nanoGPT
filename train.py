@@ -57,6 +57,7 @@ if ddp:
 else:
     master_process = True
     seed_offset = 0
+    ddp_rank = 0
     ddp_world_size = 1
 
 torch.manual_seed(1337 + seed_offset)
