@@ -137,10 +137,12 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x)  # B, T, V
-        loss = None
         if y is not None:
+            logits = self.lm_head(x)  # B, T, V
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        else:
+            logits = self.lm_head(x[:, -1, :])
+            loss = None
         return logits, loss
 
     @classmethod
@@ -197,6 +199,24 @@ class GPT(nn.Module):
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
         return model
+
+    @torch.no_grad()
+    def generate(self, x, max_new_tokens=500, temperature=1.0, top_k=50):
+        self.eval()
+        for _ in range(max_new_tokens):
+            logits, _ = self(x)
+            logits = logits / temperature
+            topk_logits, _ = torch.topk(logits, 10, dim=-1)
+            min_top_k_logits = topk_logits[:, -1]
+            logits = torch.where(
+                logits < min_top_k_logits,
+                torch.full_like(logits, float("-inf")),
+                logits,
+            )
+            probs = F.softmax(logits, dim=-1)
+            ix = torch.multinomial(probs, 1)
+            x = torch.cat((x, ix), dim=1)
+        return x
 
 
 @dataclass
