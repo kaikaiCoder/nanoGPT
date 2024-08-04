@@ -26,8 +26,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding size
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         q = q.view(B, T, self.n_head, -1).transpose(1, 2)
         k = k.view(B, T, self.n_head, -1).transpose(1, 2)
         v = v.view(B, T, self.n_head, -1).transpose(1, 2)  # B, nh, T, hs
@@ -83,9 +82,10 @@ class GPT(nn.Module):
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
-        self.apply(self.__init_weight__)
+        self.apply(self._init_weights)
+        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
-    def __init_weight__(self, module):
+    def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, "NANOGPT_SCALE_INIT"):
@@ -158,10 +158,10 @@ class GPT(nn.Module):
             "gpt2-medium": dict(n_layer=24, n_head=16, n_embd=1024),  # 350M
             "gpt2-large": dict(n_layer=36, n_head=20, n_embd=1280),  # 774M
             "gpt2-xl": dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M
-        }
+        }[model_type]
         config_args["vocab_size"] = 50257
         config_args["block_size"] = 1024
-        config = GPTConfig(**config_args[model_type])
+        config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
@@ -218,6 +218,12 @@ class GPT(nn.Module):
             x = torch.cat((x, ix), dim=1)
         return x
 
+    def get_num_params(self, non_embedding=True):
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
+        return n_params
+
 
 @dataclass
 class GPTConfig:
@@ -228,3 +234,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    dropout: float = 0.0
+
+
+GPT.from_pretrained("gpt2")
