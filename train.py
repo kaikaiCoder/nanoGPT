@@ -12,7 +12,9 @@ from contextlib import nullcontext
 from model import GPTConfig, GPT
 from data_loader import DataLoader
 
+init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 backend = "nccl"
+total_batch_size = 2**19 # 2**19 = 524288
 gradient_accumulation_steps = 5 * 8  # accumulate gradients over N steps
 batch_size = 16
 block_size = 1024
@@ -77,9 +79,6 @@ ctx = (
     else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
 
-# gradient accumulation
-total_batch_size = 2**19
-
 assert (
     total_batch_size % (batch_size * block_size * ddp_world_size) == 0
 ), "make sure total_batch_size is divisible by B*T*ddp_world_size"
@@ -104,7 +103,28 @@ val_loader = DataLoader(
     split="val",
 )
 
-model = GPT(GPTConfig())
+if init_from == "scratch":
+    print("Initializing a new model from scratch")
+    model = GPT(GPTConfig())
+elif init_from == "resume":
+    # find the latest checkpoint file
+    checkpoint_files = [
+        f for f in os.listdir(out_dir) if f.startswith("model_") and f.endswith(".pt")
+    ]
+    assert len(checkpoint_files) > 0, "no model checkpoints found"
+    checkpoint_files = sorted(checkpoint_files)
+    checkpoint_file = checkpoint_files[-1]
+    checkpoint_path = os.path.join(out_dir, checkpoint_file)
+    checkpoint = torch.load(checkpoint_path)
+    model = GPT(checkpoint["config"])
+    model.load_state_dict(checkpoint["model"])
+    step = checkpoint["step"]
+    print(f"resuming from step {step}")
+elif init_from.startswith("gpt2"):
+    print(f"Initializing from pretrained GPT2 model {init_from}")
+    model = GPT.from_pretrained(init_from)
+
+# model = GPT(GPTConfig())
 model.to(device)
 if useCompile:
     model = torch.compile(model)
@@ -130,10 +150,12 @@ def get_lr(it):
 optimizer = raw_model.configure_optimizers(
     weight_decay=0.1, learning_rate=6e-4, device_type=device_type
 )
+if init_from == "resume":
+    optimizer.load_state_dict(checkpoint["optimizer"])
 
 
 @torch.no_grad()
-def val(step):
+def val():
     model.eval()
     val_loader.reset()
     val_loss_accum = 0.0
@@ -189,7 +211,7 @@ def get_most_likely_row(tokens, mask, logits):
 
 
 @torch.no_grad()
-def sample(step):
+def sample():
     num_correct_norm = 0
     num_total = 0
     for i, example in enumerate(iterate_examples("val")):
@@ -223,14 +245,14 @@ def sample(step):
 
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
-
-for step in range(max_steps):
+step = 0
+while True:
     last_step = step == max_steps - 1
     t0 = time.time()
     if not useCompile and (step % eval_interval == 0 or last_step):
-        val(step)
+        val()
     if (step % sample_invterval == 0 or last_step) and (not useCompile):
-        sample(step)
+        sample()
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
@@ -270,5 +292,8 @@ for step in range(max_steps):
         )
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
+    step += 1
+    if step > max_steps:
+        break
 if ddp:
     destroy_process_group()
