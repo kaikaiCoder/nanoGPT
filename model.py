@@ -247,6 +247,3 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-
-
-GPT.from_pretrained("gpt2")
