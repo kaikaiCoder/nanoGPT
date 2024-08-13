@@ -12,10 +12,9 @@ from contextlib import nullcontext
 from model import GPTConfig, GPT
 from data_loader import DataLoader
 
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+init_from = "scratch"  # 'scratch' or 'resume' or 'gpt2*'
 backend = "nccl"
-total_batch_size = 2**19 # 2**19 = 524288
-gradient_accumulation_steps = 5 * 8  # accumulate gradients over N steps
+total_batch_size = 524288  # 2**19, ~0.5M, in number of tokens
 batch_size = 16
 block_size = 1024
 device = "cuda"
@@ -36,7 +35,7 @@ log_dir = "log"
 
 # set up distributed data parallel
 # DDP launch  for 2 GPUs:
-# torchrun --standalone --nproc_per_node=2 train_gpt.py
+# torchrun --standalone --nproc_per_node=2 train.py
 ddp = int(os.environ.get("RANK", -1)) != -1
 if ddp:
     print("using distributed data parallel")
@@ -46,21 +45,21 @@ if ddp:
     ddp_world_size = int(os.environ["WORLD_SIZE"])
     device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
-    master_process = (
-        ddp_rank == 0
-    )  # only the master process will print, write to disk, etc.
+    master_process = ddp_rank == 0
     seed_offset = ddp_rank  # each process gets a different random seed
-    assert (
-        gradient_accumulation_steps % ddp_world_size == 0
-    )  # make sure gradient accumulation is divisible by world size
-    gradient_accumulation_steps //= (
-        ddp_world_size  # each process will accumulate gradients over fewer steps
-    )
 else:
     master_process = True
     seed_offset = 0
     ddp_rank = 0
     ddp_world_size = 1
+
+assert (
+    total_batch_size % (batch_size * block_size * ddp_world_size) == 0
+), "make sure total_batch_size is divisible by B * T * ddp_world_size"
+
+gradient_accumulation_steps = total_batch_size // (
+    batch_size * block_size * ddp_world_size
+)
 
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -79,14 +78,8 @@ ctx = (
     else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
 
-assert (
-    total_batch_size % (batch_size * block_size * ddp_world_size) == 0
-), "make sure total_batch_size is divisible by B*T*ddp_world_size"
 if master_process:
-    print(f"total desired batch size: {total_batch_size}")
-    print(
-        f"=> gradient accumulation steps: {total_batch_size} % {batch_size} * {block_size} * {ddp_world_size} = {gradient_accumulation_steps}"
-    )
+    os.makedirs(out_dir, exist_ok=True)
 
 train_loader = DataLoader(
     batch_size,
@@ -124,7 +117,6 @@ elif init_from.startswith("gpt2"):
     print(f"Initializing from pretrained GPT2 model {init_from}")
     model = GPT.from_pretrained(init_from)
 
-# model = GPT(GPTConfig())
 model.to(device)
 if useCompile:
     model = torch.compile(model)
